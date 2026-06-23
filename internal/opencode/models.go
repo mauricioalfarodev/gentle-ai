@@ -425,10 +425,11 @@ func globalConfigPaths(settingsPath string) []string {
 	if !strings.EqualFold(filepath.Base(settingsPath), "opencode.json") {
 		return []string{settingsPath}
 	}
-	if _, err := os.Stat(settingsPath); err == nil || !errors.Is(err, os.ErrNotExist) {
-		return []string{settingsPath}
-	}
-	return []string{settingsPath, filepath.Join(filepath.Dir(settingsPath), "opencode.jsonc")}
+	// Always probe both opencode.json and opencode.jsonc so that a user who
+	// keeps providers in the .jsonc file (e.g. for comments) is not missed.
+	// The .jsonc entry comes last so its values win on merge.
+	jsoncPath := filepath.Join(filepath.Dir(settingsPath), "opencode.jsonc")
+	return []string{settingsPath, jsoncPath}
 }
 
 func projectConfigPaths(cwd string) []string {

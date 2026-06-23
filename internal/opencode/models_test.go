@@ -771,6 +771,43 @@ func TestLoadEffectiveConfigProvidersSourcesAndPrecedence(t *testing.T) {
 	}
 }
 
+// TestLoadEffectiveConfigProvidersJSONCWithExistingJSON verifies that when both
+// opencode.json and opencode.jsonc exist in the global config dir, providers
+// from the .jsonc file are loaded even when .json is present and has no providers.
+func TestLoadEffectiveConfigProvidersJSONCWithExistingJSON(t *testing.T) {
+	t.Setenv("OPENCODE_CONFIG", "")
+	t.Setenv("OPENCODE_CONFIG_CONTENT", "")
+
+	dir := t.TempDir()
+	// .json exists but contains no providers (common setup).
+	jsonPath := filepath.Join(dir, "opencode.json")
+	if err := os.WriteFile(jsonPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write json config: %v", err)
+	}
+	// .jsonc holds the actual providers (e.g. users prefer comments).
+	jsoncPath := filepath.Join(dir, "opencode.jsonc")
+	if err := os.WriteFile(jsoncPath, []byte(`{
+		// Custom provider defined in .jsonc
+		"provider": {
+			"lite-llm": {"name": "Lite LLM", "models": {"my-model": {"name": "My Model", "tool_call": false}}},
+		},
+	}`), 0o644); err != nil {
+		t.Fatalf("write jsonc config: %v", err)
+	}
+
+	config, err := LoadEffectiveConfigProvidersForDir(jsonPath, dir)
+	if err != nil {
+		t.Fatalf("LoadEffectiveConfigProvidersForDir() error = %v", err)
+	}
+	if _, ok := config["lite-llm"]; !ok {
+		keys := make([]string, 0, len(config))
+		for k := range config {
+			keys = append(keys, k)
+		}
+		t.Fatalf("expected provider %q to be loaded from .jsonc when .json exists but has no providers; got keys: %v", "lite-llm", keys)
+	}
+}
+
 func TestLoadEffectiveConfigProvidersAcceptsInlineJSONC(t *testing.T) {
 	t.Setenv("OPENCODE_CONFIG", "")
 	t.Setenv("OPENCODE_CONFIG_CONTENT", `{
