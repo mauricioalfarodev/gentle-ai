@@ -1115,6 +1115,59 @@ func TestNewModelPickerStateCollisionCustomWins(t *testing.T) {
 	}
 }
 
+func TestNewModelPickerStateDiscoversProjectOpenCodeConfig(t *testing.T) {
+	cachePath := writeTempFile(t, "models.json", catalogJSON)
+	globalPath := writeTempFile(t, "opencode.json", `{
+		"provider": {
+			"global-provider": {
+				"name": "Global Provider",
+				"models": {"global-model": {"name": "Global Model", "tool_call": true}}
+			}
+		}
+	}`)
+
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, ".git"), 0o755); err != nil {
+		t.Fatalf("create git marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "opencode.jsonc"), []byte(`{
+		// Project provider should be visible to the picker.
+		"provider": {
+			"lite-llm": {
+				"name": "LITE-LLM",
+				"models": {"proxy-model": {"name": "Proxy Model", "tool_call": true}},
+			},
+		},
+	}`), 0o644); err != nil {
+		t.Fatalf("write project opencode.jsonc: %v", err)
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatalf("chdir project dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldWD); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
+
+	state := NewModelPickerState(cachePath, globalPath)
+
+	if _, ok := state.Providers["global-provider"]; !ok {
+		t.Fatalf("missing provider from global config; got keys: %v", providerKeys(state.Providers))
+	}
+	if _, ok := state.Providers["lite-llm"]; !ok {
+		t.Fatalf("missing provider from project config; got keys: %v", providerKeys(state.Providers))
+	}
+	if !containsString(state.AvailableIDs, "lite-llm") {
+		t.Fatalf("project custom provider not selectable; AvailableIDs = %v", state.AvailableIDs)
+	}
+}
+
 // providerKeys returns the keys of a Provider map for test error messages.
 func providerKeys(providers map[string]opencode.Provider) []string {
 	keys := make([]string, 0, len(providers))
@@ -1122,6 +1175,15 @@ func providerKeys(providers map[string]opencode.Provider) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ─── Separator row (non-selectable) ────────────────────────────────────────

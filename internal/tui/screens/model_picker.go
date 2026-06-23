@@ -78,14 +78,14 @@ type ModelPickerState struct {
 }
 
 // NewModelPickerState initializes the picker state from the models cache,
-// merging any custom providers defined in the OpenCode settings file.
+// merging any custom providers defined in OpenCode's effective config.
 func NewModelPickerState(cachePath string, settingsPath string) ModelPickerState {
 	providers, err := opencode.LoadModelsOrEmpty(cachePath)
 	if err != nil {
 		return ModelPickerState{}
 	}
 
-	configProviders, configErr := opencode.LoadConfigProviders(settingsPath)
+	configProviders, configErr := opencode.LoadEffectiveConfigProviders(settingsPath)
 	if len(configProviders) > 0 {
 		providers = opencode.MergeCustomProviders(providers, configProviders)
 	}

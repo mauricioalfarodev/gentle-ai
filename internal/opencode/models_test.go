@@ -566,6 +566,237 @@ func TestLoadConfigProvidersInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestLoadConfigProvidersJSONC(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.jsonc")
+	if err := os.WriteFile(path, []byte(`{
+		// Project-local provider
+		"provider": {
+			"lite-llm": {
+				"name": "LITE-LLM",
+				"models": {
+					"claude-proxy": {"name": "Claude Proxy", "tool_call": true},
+				},
+			},
+		},
+	}`), 0o644); err != nil {
+		t.Fatalf("write JSONC config: %v", err)
+	}
+
+	config, err := LoadConfigProviders(path)
+	if err != nil {
+		t.Fatalf("LoadConfigProviders() error = %v", err)
+	}
+	if _, ok := config["lite-llm"]; !ok {
+		t.Fatalf("missing JSONC provider; got %v", config)
+	}
+}
+
+func TestLoadConfigProvidersJSONCSyntax(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{
+			name: "line and block markers inside strings",
+			content: `{
+				"provider": {
+					"strings": {"name": "https://example.test/*not-a-comment*/", "models": {"m": {"name": "// not a comment", "tool_call": true}}}
+				}
+			}`,
+		},
+		{
+			name: "block comments and trailing array commas",
+			content: `{
+				/* provider block */
+				"provider": {
+					"block": {"name": "Block", "models": {"m": {"name": "Model", "tool_call": true}}},
+				},
+				"disabled_providers": ["openai",],
+			}`,
+		},
+		{
+			name:    "malformed unterminated block comment",
+			content: `{"provider": { /* unterminated`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "opencode.jsonc")
+			if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
+				t.Fatalf("write JSONC config: %v", err)
+			}
+
+			_, err := LoadConfigProviders(path)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected parse error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("LoadConfigProviders() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadEffectiveConfigProvidersIncludesProjectConfig(t *testing.T) {
+	t.Setenv("OPENCODE_CONFIG", "")
+	t.Setenv("OPENCODE_CONFIG_CONTENT", "")
+
+	dir := t.TempDir()
+	globalPath := filepath.Join(dir, "global", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(globalPath), 0o755); err != nil {
+		t.Fatalf("create global dir: %v", err)
+	}
+	if err := os.WriteFile(globalPath, []byte(`{
+		"provider": {
+			"global-only": {"name": "Global Only", "models": {"global-model": {"tool_call": true}}},
+			"shared": {"name": "Global Shared", "models": {"base-model": {"name": "Base", "tool_call": true}}}
+		}
+	}`), 0o644); err != nil {
+		t.Fatalf("write global config: %v", err)
+	}
+
+	projectDir := filepath.Join(dir, "repo")
+	workDir := filepath.Join(projectDir, "subdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("create project dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "opencode.json"), []byte(`{
+		"provider": {
+			"lite-llm": {"name": "LITE-LLM", "models": {"proxy-model": {"name": "Proxy", "tool_call": true}}},
+			"shared": {"name": "Project Shared", "models": {"project-model": {"name": "Project", "tool_call": true}}}
+		}
+	}`), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	config, err := LoadEffectiveConfigProvidersForDir(globalPath, workDir)
+	if err != nil {
+		t.Fatalf("LoadEffectiveConfigProvidersForDir() error = %v", err)
+	}
+
+	if _, ok := config["global-only"]; !ok {
+		t.Fatalf("missing provider from global config; got %v", config)
+	}
+	if _, ok := config["lite-llm"]; !ok {
+		t.Fatalf("missing provider from project config; got %v", config)
+	}
+	shared := config["shared"]
+	if shared.Name != "Project Shared" {
+		t.Fatalf("shared provider name = %q, want project override", shared.Name)
+	}
+	if _, ok := shared.Models["base-model"]; !ok {
+		t.Fatalf("shared provider lost global model: %v", shared.Models)
+	}
+	if _, ok := shared.Models["project-model"]; !ok {
+		t.Fatalf("shared provider missing project model: %v", shared.Models)
+	}
+}
+
+func TestLoadEffectiveConfigProvidersSourcesAndPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	globalDir := filepath.Join(dir, "global")
+	if err := os.MkdirAll(globalDir, 0o755); err != nil {
+		t.Fatalf("create global dir: %v", err)
+	}
+	globalPath := filepath.Join(globalDir, "opencode.json")
+	globalJSONCPath := filepath.Join(globalDir, "opencode.jsonc")
+	if err := os.WriteFile(globalJSONCPath, []byte(`{
+		// Global fallback provider.
+		"provider": {
+			"shared": {"name": "Global", "models": {"global-model": {"name": "Global Model", "tool_call": true}}},
+		},
+	}`), 0o644); err != nil {
+		t.Fatalf("write global jsonc config: %v", err)
+	}
+
+	explicitPath := filepath.Join(dir, "explicit.json")
+	if err := os.WriteFile(explicitPath, []byte(`{
+		"provider": {
+			"shared": {"name": "Explicit", "models": {"explicit-model": {"name": "Explicit Model", "tool_call": true}}}
+		}
+	}`), 0o644); err != nil {
+		t.Fatalf("write explicit config: %v", err)
+	}
+	t.Setenv("OPENCODE_CONFIG", explicitPath)
+	t.Setenv("OPENCODE_CONFIG_CONTENT", `{
+		"provider": {
+			"shared": {"name": "Inline", "models": {"inline-model": {"name": "Inline Model", "tool_call": true}}}
+		}
+	}`)
+
+	projectDir := filepath.Join(dir, "repo")
+	workDir := filepath.Join(projectDir, "subdir")
+	if err := os.MkdirAll(filepath.Join(projectDir, ".git"), 0o755); err != nil {
+		t.Fatalf("create git marker: %v", err)
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("create work dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectDir, ".opencode"), 0o755); err != nil {
+		t.Fatalf("create .opencode dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "opencode.json"), []byte(`{
+		"provider": {
+			"shared": {"name": "Project", "models": {"project-model": {"name": "Project Model", "tool_call": true}}}
+		}
+	}`), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, ".opencode", "opencode.json"), []byte(`{
+		"provider": {
+			"shared": {"name": "Dot OpenCode", "models": {"dot-model": {"name": "Dot Model", "tool_call": true}}}
+		}
+	}`), 0o644); err != nil {
+		t.Fatalf("write .opencode config: %v", err)
+	}
+
+	config, err := LoadEffectiveConfigProvidersForDir(globalPath, workDir)
+	if err != nil {
+		t.Fatalf("LoadEffectiveConfigProvidersForDir() error = %v", err)
+	}
+
+	shared := config["shared"]
+	if shared.Name != "Inline" {
+		t.Fatalf("shared provider name = %q, want inline content to win", shared.Name)
+	}
+	for _, modelID := range []string{"global-model", "explicit-model", "project-model", "dot-model", "inline-model"} {
+		if _, ok := shared.Models[modelID]; !ok {
+			t.Fatalf("shared provider missing %s: %v", modelID, shared.Models)
+		}
+	}
+}
+
+func TestLoadEffectiveConfigProvidersAcceptsInlineJSONC(t *testing.T) {
+	t.Setenv("OPENCODE_CONFIG", "")
+	t.Setenv("OPENCODE_CONFIG_CONTENT", `{
+		// Inline content can use JSONC syntax.
+		"provider": {
+			"inline": {"name": "Inline", "models": {"inline-model": {"name": "Inline Model", "tool_call": true}}},
+		},
+	}`)
+
+	dir := t.TempDir()
+	globalPath := filepath.Join(dir, "opencode.json")
+
+	config, err := LoadEffectiveConfigProvidersForDir(globalPath, dir)
+	if err != nil {
+		t.Fatalf("LoadEffectiveConfigProvidersForDir() error = %v", err)
+	}
+
+	provider, ok := config["inline"]
+	if !ok {
+		t.Fatalf("missing inline provider: %v", config)
+	}
+	if _, ok := provider.Models["inline-model"]; !ok {
+		t.Fatalf("missing inline model: %v", provider.Models)
+	}
+}
+
 // MergeCustomProviders
 
 func TestMergeCustomProvidersNewProvider(t *testing.T) {

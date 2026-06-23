@@ -1,12 +1,14 @@
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // DefaultCachePath returns the default path to the OpenCode models cache file.
@@ -341,17 +343,232 @@ func LoadConfigProviders(path string) (map[string]ConfigProvider, error) {
 		}
 		return map[string]ConfigProvider{}, err
 	}
+	return loadConfigProvidersData(path, data)
+}
 
+func loadConfigProvidersData(source string, data []byte) (map[string]ConfigProvider, error) {
 	var raw struct {
 		Provider map[string]ConfigProvider `json:"provider"`
 	}
+	if source == "OPENCODE_CONFIG_CONTENT" || strings.EqualFold(filepath.Ext(source), ".jsonc") {
+		data = stripJSONC(data)
+	}
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return map[string]ConfigProvider{}, fmt.Errorf("parse opencode settings %q: %w", path, err)
+		return map[string]ConfigProvider{}, fmt.Errorf("parse opencode settings %q: %w", source, err)
 	}
 	if raw.Provider == nil {
 		return map[string]ConfigProvider{}, nil
 	}
 	return raw.Provider, nil
+}
+
+// LoadEffectiveConfigProviders loads custom providers from OpenCode's effective
+// config sources: the global settings path plus project config discovered from
+// the current working directory. Project config overrides global config.
+func LoadEffectiveConfigProviders(settingsPath string) (map[string]ConfigProvider, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		providers, loadErr := LoadConfigProviders(settingsPath)
+		if loadErr != nil {
+			return providers, loadErr
+		}
+		return providers, err
+	}
+	return LoadEffectiveConfigProvidersForDir(settingsPath, cwd)
+}
+
+// LoadEffectiveConfigProvidersForDir is the testable form of
+// LoadEffectiveConfigProviders.
+func LoadEffectiveConfigProvidersForDir(settingsPath, cwd string) (map[string]ConfigProvider, error) {
+	merged := map[string]ConfigProvider{}
+	var firstErr error
+
+	for _, path := range globalConfigPaths(settingsPath) {
+		providers, err := LoadConfigProviders(path)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		merged = mergeConfigProviders(merged, providers)
+	}
+
+	if path := os.Getenv("OPENCODE_CONFIG"); path != "" {
+		providers, err := LoadConfigProviders(path)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		merged = mergeConfigProviders(merged, providers)
+	}
+
+	for _, path := range projectConfigPaths(cwd) {
+		providers, err := LoadConfigProviders(path)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		merged = mergeConfigProviders(merged, providers)
+	}
+
+	if content := os.Getenv("OPENCODE_CONFIG_CONTENT"); content != "" {
+		providers, err := loadConfigProvidersData("OPENCODE_CONFIG_CONTENT", []byte(content))
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		merged = mergeConfigProviders(merged, providers)
+	}
+
+	return merged, firstErr
+}
+
+func globalConfigPaths(settingsPath string) []string {
+	if settingsPath == "" {
+		return nil
+	}
+	if !strings.EqualFold(filepath.Base(settingsPath), "opencode.json") {
+		return []string{settingsPath}
+	}
+	if _, err := os.Stat(settingsPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return []string{settingsPath}
+	}
+	return []string{settingsPath, filepath.Join(filepath.Dir(settingsPath), "opencode.jsonc")}
+}
+
+func projectConfigPaths(cwd string) []string {
+	var dirs []string
+	for dir := filepath.Clean(cwd); ; dir = filepath.Dir(dir) {
+		dirs = append(dirs, dir)
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+
+	paths := make([]string, 0, len(dirs)*3)
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := dirs[i]
+		paths = append(paths,
+			filepath.Join(dir, "opencode.json"),
+			filepath.Join(dir, "opencode.jsonc"),
+			filepath.Join(dir, ".opencode", "opencode.json"),
+		)
+	}
+	return paths
+}
+
+func mergeConfigProviders(base, override map[string]ConfigProvider) map[string]ConfigProvider {
+	if len(override) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]ConfigProvider{}
+	}
+	for id, incoming := range override {
+		existing := base[id]
+		if incoming.Name != "" {
+			existing.Name = incoming.Name
+		}
+		if len(incoming.Models) > 0 {
+			if existing.Models == nil {
+				existing.Models = map[string]ConfigModel{}
+			}
+			for modelID, model := range incoming.Models {
+				existing.Models[modelID] = model
+			}
+		}
+		base[id] = existing
+	}
+	return base
+}
+
+func stripJSONC(data []byte) []byte {
+	var out bytes.Buffer
+	inString := false
+	escaped := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out.WriteByte(c)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		if c == '"' {
+			inString = true
+			out.WriteByte(c)
+			continue
+		}
+		if c == '/' && i+1 < len(data) && data[i+1] == '/' {
+			for i < len(data) && data[i] != '\n' {
+				i++
+			}
+			if i < len(data) {
+				out.WriteByte(data[i])
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(data) && data[i+1] == '*' {
+			i += 2
+			for i+1 < len(data) && !(data[i] == '*' && data[i+1] == '/') {
+				i++
+			}
+			i++
+			continue
+		}
+		out.WriteByte(c)
+	}
+
+	return removeTrailingJSONCommas(out.Bytes())
+}
+
+func removeTrailingJSONCommas(data []byte) []byte {
+	var out bytes.Buffer
+	inString := false
+	escaped := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out.WriteByte(c)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out.WriteByte(c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\r' || data[j] == '\n') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				continue
+			}
+		}
+		out.WriteByte(c)
+	}
+	return out.Bytes()
 }
 
 // MergeCustomProviders merges custom providers from opencode.json into the cache-loaded
